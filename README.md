@@ -120,3 +120,7 @@ Use a `.docx` extension when setting the output path.
   **manual correction**.
 - Fonts cannot be embedded when they are missing from the PDF or their license
   flags prohibit it.
+
+## License
+
+Released under the [MIT License](LICENSE).
