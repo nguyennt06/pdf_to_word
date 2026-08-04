@@ -20,7 +20,14 @@ common image and heading issues after conversion.
 
 ## Installation
 
-Run the commands once from the project directory.
+Clone the repository and enter the project directory:
+
+```bash
+git clone https://github.com/nguyennt06/pdf_to_word.git
+cd pdf_to_word
+```
+
+Install the dependencies once.
 
 Linux, macOS, or WSL:
 
