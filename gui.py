@@ -84,18 +84,18 @@ class UniversalConverterApp(ctk.CTk):
         )
         self.label_dir.pack(pady=5)
 
-        # 3. Dönüştürme Butonu
+       # 3. Dönüştürme Butonu (Göz Yormayan Koyu Mavi Tonları)
         self.btn_convert = ctk.CTkButton(
             self.main_frame,
             text="🔄 Dönüştür",
             font=ctk.CTkFont(size=16, weight="bold"),
             command=self.start_conversion_thread,
-            fg_color="#27ae60",
-            hover_color="#1e8449",
+            fg_color="#2B6CB0",      # Göz yormayan koyu mavi
+            hover_color="#2C5282",   # Üzerine gelindiğinde hafif koyulaşan ton
             width=280,
             height=45,
             corner_radius=10,
-            state="disabled",
+            state="disabled"
         )
         self.btn_convert.pack(pady=15)
 
