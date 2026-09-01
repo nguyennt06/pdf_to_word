@@ -12,23 +12,43 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from uuid import uuid4
 
-import pymupdf
-from docx import Document
-from docx.enum.text import WD_ALIGN_PARAGRAPH
-from docx.opc.constants import RELATIONSHIP_TYPE as RT
-from docx.opc.oxml import serialize_part_xml
-from docx.opc.part import Part
-from docx.oxml import OxmlElement, parse_xml
-from docx.oxml.ns import qn
-from docx.text.paragraph import Paragraph
-from docx.text.run import Run
-from fontTools.ttLib import TTFont
-from pdf2docx import Converter
-from pdf2docx.common import docx as pdf2docx_docx
-from pdf2docx.common.share import decode
-from pdf2docx.font.Fonts import Fonts
-from pdf2docx.page.RawPage import RawPage
-from pdf2docx.text.Lines import Lines
+try:
+    import fitz as pymupdf  # type: ignore[import-not-found]
+except ImportError:
+    try:
+        import pymupdf  # type: ignore[import-not-found]
+    except ImportError as exc:
+        raise ImportError(
+            "PyMuPDF is required. Install it with: pip install pymupdf"
+        ) from exc
+
+try:
+    from docx import Document  # type: ignore[import-not-found]
+    from docx.enum.text import WD_ALIGN_PARAGRAPH  # type: ignore[import-not-found]
+    from docx.opc.constants import RELATIONSHIP_TYPE as RT  # type: ignore[import-not-found]
+    from docx.opc.oxml import serialize_part_xml  # type: ignore[import-not-found]
+    from docx.opc.part import Part  # type: ignore[import-not-found]
+    from docx.oxml import OxmlElement, parse_xml  # type: ignore[import-not-found]
+    from docx.oxml.ns import qn  # type: ignore[import-not-found]
+    from docx.text.paragraph import Paragraph  # type: ignore[import-not-found]
+    from docx.text.run import Run  # type: ignore[import-not-found]
+except ImportError as exc:
+    raise ImportError(
+        "python-docx is required. Install it with: pip install python-docx"
+    ) from exc
+
+try:
+    from fontTools.ttLib import TTFont  # type: ignore[import-not-found]
+    from pdf2docx import Converter  # type: ignore[import-not-found]
+    from pdf2docx.common import docx as pdf2docx_docx  # type: ignore[import-not-found]
+    from pdf2docx.common.share import decode  # type: ignore[import-not-found]
+    from pdf2docx.font.Fonts import Fonts  # type: ignore[import-not-found]
+    from pdf2docx.page.RawPage import RawPage  # type: ignore[import-not-found]
+    from pdf2docx.text.Lines import Lines  # type: ignore[import-not-found]
+except ImportError as exc:
+    raise ImportError(
+        "pdf2docx is required. Install it with: pip install pdf2docx"
+    ) from exc
 
 
 ROMAN_HEADING_PATTERN = re.compile(
