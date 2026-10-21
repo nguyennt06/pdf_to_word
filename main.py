@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import argparse
 import re
+import unicodedata
 from collections import defaultdict
 from copy import deepcopy
 from dataclasses import dataclass, replace
+from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
 from io import BytesIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -14,7 +16,11 @@ from uuid import uuid4
 
 import pymupdf
 from docx import Document
-from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.enum.text import (
+    WD_ALIGN_PARAGRAPH,
+    WD_TAB_ALIGNMENT,
+    WD_TAB_LEADER,
+)
 from docx.opc.constants import RELATIONSHIP_TYPE as RT
 from docx.opc.oxml import serialize_part_xml
 from docx.opc.part import Part
@@ -22,12 +28,14 @@ from docx.oxml import OxmlElement, parse_xml
 from docx.oxml.ns import qn
 from docx.text.paragraph import Paragraph
 from docx.text.run import Run
+from docx.shared import Inches, Pt
 from fontTools.ttLib import TTFont
 from pdf2docx import Converter
 from pdf2docx.common import docx as pdf2docx_docx
 from pdf2docx.common.share import decode
 from pdf2docx.font.Fonts import Fonts
 from pdf2docx.page.RawPage import RawPage
+from pdf2docx.page.RawPageFitz import RawPageFitz
 from pdf2docx.text.Lines import Lines
 
 
@@ -93,6 +101,16 @@ class FontRecord:
     source_descriptor: str
     name: str
     line_height: float | None
+
+
+@dataclass(frozen=True)
+class TocEntry:
+    label: str
+    title: str
+    page: str
+    bold: bool
+    font_name: str
+    font_size: float
 
 
 def _font_name(font, *name_ids: int) -> str:
@@ -319,6 +337,7 @@ def _add_hyperlink(paragraph, url: str, label: str):
 _pdf2docx_create_section = RawPage._create_section
 _pdf2docx_parse_line_break = Lines.parse_line_break
 _pdf2docx_split_text_rows = Lines.split_vertically_by_text
+_pdf2docx_preprocess_text = RawPageFitz._preprocess_text
 
 
 def _create_pdf_section(num_columns, elements, horizontal_range, y_reference):
@@ -400,16 +419,520 @@ def _parse_pdf_line_breaks(
         next_size = _largest_font_size(next_row)
         smaller = min(current_size, next_size)
         larger = max(current_size, next_size)
-        if smaller and larger >= smaller * 1.5:
+        next_text = "".join(line.text for line in next_row).lstrip()
+        starts_numbered_item = re.match(r"\d{1,3}[.)]\s+", next_text)
+        if (smaller and larger >= smaller * 1.5) or starts_numbered_item:
             row[-1].line_break = 1
 
 
-def configure_font_reader() -> None:
+def _restore_pdf_spaces(text_blocks) -> tuple[int, int]:
+    """Keep PDF spaces that pdf2docx drops and infer spaces missing from text maps."""
+    preserved = 0
+    inferred = 0
+
+    for block in text_blocks:
+        if block.get("type") != 0:
+            continue
+
+        for line in block.get("lines", []):
+            direction = line.get("dir", (1.0, 0.0))
+            if (
+                abs(direction[0] - 1.0) > 0.01
+                or abs(direction[1]) > 0.01
+                or line.get("wmode", 0)
+            ):
+                continue
+
+            spans = line.get("spans", [])
+
+            # pdf2docx removes spans that contain only whitespace. Attach those
+            # spaces to the preceding glyph, as its line-break handling does.
+            for index, span in enumerate(spans):
+                chars = span.get("chars", [])
+                text = "".join(char.get("c", "") for char in chars)
+                if not chars or not text or not text.isspace() or span.get("style"):
+                    continue
+
+                previous = next(
+                    (
+                        candidate
+                        for candidate in reversed(spans[:index])
+                        if any(
+                            char.get("c", "").strip()
+                            for char in candidate.get("chars", [])
+                        )
+                    ),
+                    None,
+                )
+                following = next(
+                    (
+                        candidate
+                        for candidate in spans[index + 1 :]
+                        if any(
+                            char.get("c", "").strip()
+                            for char in candidate.get("chars", [])
+                        )
+                    ),
+                    None,
+                )
+                if previous and following and previous.get("chars"):
+                    previous["chars"][-1]["c"] += text
+                    span["chars"] = []
+                    preserved += len(text)
+
+            chars = [
+                (span, char)
+                for span in spans
+                for char in span.get("chars", [])
+                if char.get("c")
+            ]
+            for (previous_span, previous), (current_span, current) in zip(
+                chars, chars[1:]
+            ):
+                previous_text = previous.get("c", "")
+                current_text = current.get("c", "")
+                if (
+                    len(previous_text) != 1
+                    or len(current_text) != 1
+                    or not previous_text.isalnum()
+                    or not current_text.isalnum()
+                ):
+                    continue
+
+                gap = current["bbox"][0] - previous["bbox"][2]
+                size = min(
+                    previous_span.get("size", 12.0),
+                    current_span.get("size", 12.0),
+                )
+                if gap > max(0.18 * size, 0.75):
+                    previous["c"] += " "
+                    inferred += 1
+
+        # Separate raw lines can share a baseline when the PDF stores adjacent
+        # text fragments as distinct lines inside one block (for example, a name
+        # and student number). Preserve their visual separator in the text flow.
+        lines = block.get("lines", [])
+        for previous_line, current_line in zip(lines, lines[1:]):
+            previous_direction = previous_line.get("dir", (1.0, 0.0))
+            current_direction = current_line.get("dir", (1.0, 0.0))
+            if (
+                abs(previous_direction[0] - 1.0) > 0.01
+                or abs(previous_direction[1]) > 0.01
+                or abs(current_direction[0] - 1.0) > 0.01
+                or abs(current_direction[1]) > 0.01
+                or previous_line.get("wmode", 0)
+                or current_line.get("wmode", 0)
+            ):
+                continue
+
+            previous_chars = [
+                char
+                for span in previous_line.get("spans", [])
+                for char in span.get("chars", [])
+                if char.get("c")
+            ]
+            current_chars = [
+                char
+                for span in current_line.get("spans", [])
+                for char in span.get("chars", [])
+                if char.get("c")
+            ]
+            if not previous_chars or not current_chars:
+                continue
+            previous, current = previous_chars[-1], current_chars[0]
+            previous_text = previous.get("c", "")
+            current_text = current.get("c", "")
+            if (
+                len(previous_text) != 1
+                or len(current_text) != 1
+                or not previous_text.isalnum()
+                or not current_text.isalnum()
+            ):
+                continue
+
+            previous_baseline = previous.get("origin", (0.0, 0.0))[1]
+            current_baseline = current.get("origin", (0.0, 0.0))[1]
+            size = min(
+                previous_line["spans"][-1].get("size", 12.0),
+                current_line["spans"][0].get("size", 12.0),
+            )
+            gap = current["bbox"][0] - previous["bbox"][2]
+            if abs(previous_baseline - current_baseline) <= 0.2 * size:
+                if gap <= max(0.18 * size, 0.75):
+                    continue
+                previous["c"] += " "
+                inferred += 1
+            elif previous_text[-1].isalnum() and current_text[0].isalnum():
+                previous["c"] += " "
+                inferred += 1
+
+    return preserved, inferred
+
+
+CONTENTS_PAGE_NUMBER = re.compile(r"^(?:\d{1,3}|[ivxlcdm]{1,8})$", re.IGNORECASE)
+CONTENTS_LABEL = re.compile(r"^(?P<label>\d+(?:\.\d+){1,6})(?:\s+(?P<title>.*))?$")
+CONTENTS_CHAPTER = re.compile(r"^(?:CHƯƠNG|CHAPTER)\s+\d+\b", re.IGNORECASE)
+
+
+def _normalize_contents_heading(text: str) -> str:
+    """Normalize a heading for matching across Vietnamese and English PDFs."""
+    text = text.replace("Đ", "D").replace("đ", "d")
+    text = unicodedata.normalize("NFD", text)
+    text = "".join(char for char in text if unicodedata.category(char) != "Mn")
+    return re.sub(r"[^A-Z0-9]+", " ", text.upper()).strip()
+
+
+def _extract_contents_page_entries(page) -> list[TocEntry]:
+    """Read TOC rows from their PDF coordinates, joining wrapped titles."""
+    raw_page = page.get_text("rawdict", sort=True)
+    _restore_pdf_spaces(raw_page.get("blocks", []))
+
+    segments = []
+    for block in raw_page.get("blocks", []):
+        if block.get("type") != 0:
+            continue
+        for line in block.get("lines", []):
+            for span in line.get("spans", []):
+                chars = span.get("chars", [])
+                visible_chars = [char for char in chars if char.get("c", "").strip()]
+                text = "".join(char.get("c", "") for char in chars)
+                if not text.strip() or not visible_chars:
+                    continue
+                x = min(char["bbox"][0] for char in visible_chars)
+                y_values = [char.get("origin", (0.0, line["bbox"][3]))[1] for char in visible_chars]
+                y = sum(y_values) / len(y_values)
+                segments.append(
+                    (
+                        y,
+                        x,
+                        re.sub(r"\s+", " ", text).strip(),
+                        bool(span.get("flags", 0) & 2**4),
+                        span.get("font", ""),
+                        float(span.get("size", 13.0)),
+                    )
+                )
+
+    segments.sort(key=lambda item: (item[0], item[1]))
+    rows = []
+    for segment in segments:
+        y = segment[0]
+        if rows and abs(rows[-1][0] - y) <= 1.5:
+            rows[-1][1].append(segment)
+        else:
+            rows.append([y, [segment]])
+
+    entries = []
+    pending = None
+
+    def add_pending():
+        nonlocal pending
+        if pending and pending["page"] and pending["title"].strip():
+            entries.append(
+                TocEntry(
+                    label=pending["label"],
+                    title=pending["title"].strip(),
+                    page=pending["page"],
+                    bold=pending["bold"],
+                    font_name=pending["font_name"],
+                    font_size=pending["font_size"],
+                )
+            )
+        pending = None
+
+    for y, row_segments in rows:
+        row_segments.sort(key=lambda item: item[1])
+
+        # Printed PDF page numbers are often emitted as ordinary body text.
+        # Ignore those centered footers so they cannot become TOC rows.
+        if (
+            y > page.rect.height - 60
+            and len(row_segments) == 1
+            and CONTENTS_PAGE_NUMBER.fullmatch(row_segments[0][2])
+        ):
+            continue
+
+        page_numbers = [
+            item
+            for item in row_segments
+            if item[1] >= page.rect.width * 0.87
+            and CONTENTS_PAGE_NUMBER.fullmatch(item[2])
+        ]
+        page_number = page_numbers[-1][2] if page_numbers else None
+
+        text_segments = []
+        for item in row_segments:
+            if item[1] >= page.rect.width * 0.87:
+                continue
+            text = re.sub(r"\s*(?:\.\s*){2,}$", "", item[2]).strip()
+            text = re.sub(r"\s+\.$", "", text).strip()
+            if not text or re.fullmatch(r"(?:\.\s*)+", text):
+                continue
+            text_segments.append(item[:2] + (text,) + item[3:])
+        if not text_segments:
+            continue
+
+        row_text = re.sub(
+            r"\s+",
+            " ",
+            " ".join(item[2] for item in text_segments),
+        ).strip()
+        if _normalize_contents_heading(row_text) in {
+            "MUC LUC",
+            "TABLE OF CONTENTS",
+            "CONTENTS",
+        }:
+            continue
+
+        label_match = CONTENTS_LABEL.match(row_text)
+        is_chapter = bool(CONTENTS_CHAPTER.match(row_text))
+        is_bold = any(item[3] for item in text_segments)
+        font_name = next((item[4] for item in text_segments if item[4]), "")
+        font_size = max((item[5] for item in text_segments), default=13.0)
+
+        if is_chapter:
+            add_pending()
+            pending = {
+                "label": "",
+                "title": row_text,
+                "page": page_number,
+                "bold": is_bold,
+                "font_name": font_name,
+                "font_size": font_size,
+            }
+            if page_number:
+                add_pending()
+            continue
+
+        if label_match:
+            add_pending()
+            pending = {
+                "label": label_match.group("label"),
+                "title": label_match.group("title") or "",
+                "page": page_number,
+                "bold": is_bold,
+                "font_name": font_name,
+                "font_size": font_size,
+            }
+            if page_number:
+                add_pending()
+            continue
+
+        if pending and not pending["page"]:
+            pending["title"] = f"{pending['title']} {row_text}".strip()
+            pending["bold"] = pending["bold"] or is_bold
+            if page_number:
+                pending["page"] = page_number
+                add_pending()
+            continue
+
+        if page_number:
+            add_pending()
+            pending = {
+                "label": "",
+                "title": row_text,
+                "page": page_number,
+                "bold": is_bold,
+                "font_name": font_name,
+                "font_size": font_size,
+            }
+            add_pending()
+
+    add_pending()
+    return entries
+
+
+def _find_contents_page_groups(pdf_path: Path) -> list[tuple[int, list[TocEntry]]]:
+    """Find a contents heading and the consecutive pages containing its rows."""
+    pdf = pymupdf.open(pdf_path)
+    try:
+        for page_index, page in enumerate(pdf):
+            lines = page.get_text("text", sort=True).splitlines()
+            if not any(
+                _normalize_contents_heading(line)
+                in {"MUC LUC", "TABLE OF CONTENTS", "CONTENTS"}
+                for line in lines
+            ):
+                continue
+
+            first_entries = _extract_contents_page_entries(page)
+            if len(first_entries) < 3:
+                continue
+
+            groups = [(page_index, first_entries)]
+            next_index = page_index + 1
+            while next_index < len(pdf):
+                next_entries = _extract_contents_page_entries(pdf[next_index])
+                if len(next_entries) < 2:
+                    break
+                groups.append((next_index, next_entries))
+                next_index += 1
+            return groups
+    finally:
+        pdf.close()
+
+    return []
+
+
+def _is_contents_end_heading(text: str) -> bool:
+    """Recognize the first real section heading after the contents pages."""
+    text = re.sub(r"\s+", " ", text).strip()
+    text = re.sub(r"\s+(?:\d{1,3}|[ivxlcdm]{1,8})$", "", text, flags=re.IGNORECASE)
+    return bool(KNOWN_HEADING_PATTERN.fullmatch(text))
+
+
+def _insert_contents_page(
+    document: Document,
+    anchor,
+    entries: list[TocEntry],
+    section,
+    font_name: str | None,
+) -> None:
+    """Insert clean TOC paragraphs with stable number spacing and page leaders."""
+    page_width = section.page_width or Inches(8.27)
+    left_margin = section.left_margin or Inches(1)
+    right_margin = section.right_margin or Inches(1)
+    right_position = (
+        page_width - left_margin - right_margin
+    ) / 914400 - 0.06
+    right_position = max(right_position, 4.5)
+
+    for entry in entries:
+        paragraph_element = OxmlElement("w:p")
+        anchor.addprevious(paragraph_element)
+        paragraph = Paragraph(paragraph_element, document._body)
+        paragraph.style = document.styles["Normal"]
+        paragraph_format = paragraph.paragraph_format
+        paragraph_format.line_spacing = Pt(20.5)
+        paragraph_format.space_before = Pt(0)
+        paragraph_format.space_after = Pt(0)
+        paragraph_format.keep_together = True
+
+        if entry.label:
+            level = entry.label.count(".")
+            left_indent = 0.45 if level <= 1 else 0.86 + (level - 2) * 0.24
+            line_text = f"{entry.label}    {entry.title}"
+        else:
+            left_indent = 0.45
+            line_text = entry.title
+        paragraph_format.left_indent = Inches(left_indent)
+        paragraph_format.first_line_indent = Inches(0)
+        paragraph_format.tab_stops.add_tab_stop(
+            Inches(right_position),
+            WD_TAB_ALIGNMENT.RIGHT,
+            WD_TAB_LEADER.DOTS,
+        )
+
+        content_run = paragraph.add_run(line_text)
+        page_run = paragraph.add_run("\t" + entry.page)
+        for run in (content_run, page_run):
+            run.bold = entry.bold
+            run.font.size = Pt(entry.font_size)
+            run.font.name = font_name or entry.font_name or None
+
+
+def repair_table_of_contents(document: Document, pdf_path: Path) -> int:
+    """Rebuild fragmented PDF table-of-contents rows as aligned Word paragraphs."""
+    page_groups = _find_contents_page_groups(pdf_path)
+    if not page_groups:
+        return 0
+
+    body = document.element.body
+    body_children = list(body)
+    contents_heading = None
+    for node in body_children:
+        if node.tag != qn("w:p"):
+            continue
+        if _normalize_contents_heading(Paragraph(node, document).text) in {
+            "MUC LUC",
+            "TABLE OF CONTENTS",
+            "CONTENTS",
+        }:
+            contents_heading = node
+            break
+    if contents_heading is None:
+        return 0
+
+    heading_index = body_children.index(contents_heading)
+    section_markers = [
+        node
+        for node in body_children[heading_index + 1 :]
+        if node.find(".//" + qn("w:sectPr")) is not None
+    ]
+    if len(section_markers) < len(page_groups):
+        return 0
+
+    final_marker_index = body_children.index(section_markers[len(page_groups) - 1])
+    end_heading = None
+    for node in body_children[final_marker_index + 1 :]:
+        if node.tag != qn("w:p"):
+            continue
+        text = Paragraph(node, document).text
+        if text.strip() and _is_contents_end_heading(text):
+            end_heading = node
+            break
+    if end_heading is None:
+        return 0
+
+    end_index = body_children.index(end_heading)
+    region = body_children[heading_index + 1 : end_index]
+    markers = [
+        node
+        for node in region
+        if node.find(".//" + qn("w:sectPr")) is not None
+    ]
+
+    font_name = None
+    for node in region:
+        if node.tag != qn("w:p"):
+            continue
+        for run in Paragraph(node, document).runs:
+            if run.text.strip() and run.font.name:
+                font_name = run.font.name
+                break
+        if font_name:
+            break
+
+    for node in region:
+        if node in markers:
+            paragraph_properties = node.find(qn("w:pPr"))
+            for child in list(node):
+                if child is not paragraph_properties:
+                    node.remove(child)
+        else:
+            body.remove(node)
+
+    for group_index, (_, entries) in enumerate(page_groups):
+        anchor = markers[group_index] if group_index < len(markers) else end_heading
+        anchor_index = list(body).index(anchor)
+        section_index = sum(
+            1
+            for node in list(body)[:anchor_index]
+            if node.find(".//" + qn("w:sectPr")) is not None
+        )
+        section = document.sections[min(section_index, len(document.sections) - 1)]
+        _insert_contents_page(document, anchor, entries, section, font_name)
+
+    return sum(len(entries) for _, entries in page_groups)
+
+
+def _preprocess_pdf_text(self, **settings):
+    """Repair spaces before pdf2docx turns raw PDF spans into text runs."""
+    text_blocks = _pdf2docx_preprocess_text(self, **settings)
+    counts = _restore_pdf_spaces(text_blocks)
+    if self.space_fix_counts is not None:
+        self.space_fix_counts["preserved"] += counts[0]
+        self.space_fix_counts["inferred"] += counts[1]
+    return text_blocks
+
+
+def configure_font_reader(space_fix_counts: dict[str, int] | None = None) -> None:
     """Use stricter font-name handling during pdf2docx conversion."""
     Fonts.get_font_family_name = staticmethod(_read_font_family)
     Fonts.extract = classmethod(_extract_font_records)
     Fonts.get = _find_pdf_font
     RawPage._create_section = staticmethod(_create_pdf_section)
+    RawPageFitz._preprocess_text = _preprocess_pdf_text
+    RawPageFitz.space_fix_counts = space_fix_counts
     Lines.split_vertically_by_text = _split_pdf_text_rows
     Lines.parse_line_break = _parse_pdf_line_breaks
     pdf2docx_docx.add_hyperlink = _add_hyperlink
@@ -1512,19 +2035,229 @@ def inspect_pdf(pdf_path: Path) -> tuple[int, int]:
         return pdf.page_count, sum(len(page.get_images(full=True)) for page in pdf)
 
 
+def normalize_docx_xml(document: Document) -> int:
+    """Round invalid fractional OOXML measures and normalize hexadecimal colors."""
+    fixed = 0
+    child_order = {
+        "pPr": (
+            "pStyle",
+            "keepNext",
+            "keepLines",
+            "pageBreakBefore",
+            "framePr",
+            "widowControl",
+            "numPr",
+            "suppressLineNumbers",
+            "pBdr",
+            "shd",
+            "tabs",
+            "suppressAutoHyphens",
+            "kinsoku",
+            "wordWrap",
+            "overflowPunct",
+            "topLinePunct",
+            "autoSpaceDE",
+            "autoSpaceDN",
+            "bidi",
+            "adjustRightInd",
+            "snapToGrid",
+            "spacing",
+            "ind",
+            "contextualSpacing",
+            "mirrorIndents",
+            "suppressOverlap",
+            "jc",
+            "textDirection",
+            "textAlignment",
+            "textboxTightWrap",
+            "outlineLvl",
+            "divId",
+            "cnfStyle",
+            "rPr",
+            "sectPr",
+            "pPrChange",
+        ),
+        "rPr": (
+            "rStyle",
+            "rFonts",
+            "b",
+            "bCs",
+            "i",
+            "iCs",
+            "caps",
+            "smallCaps",
+            "strike",
+            "dstrike",
+            "outline",
+            "shadow",
+            "emboss",
+            "imprint",
+            "noProof",
+            "snapToGrid",
+            "vanish",
+            "webHidden",
+            "color",
+            "spacing",
+            "w",
+            "kern",
+            "position",
+            "sz",
+            "szCs",
+            "highlight",
+            "u",
+            "effect",
+            "bdr",
+            "shd",
+            "fitText",
+            "vertAlign",
+            "rtl",
+            "cs",
+            "em",
+            "lang",
+            "eastAsianLayout",
+            "specVanish",
+            "oMath",
+            "rPrChange",
+        ),
+        "tcBorders": (
+            "top",
+            "start",
+            "bottom",
+            "end",
+            "insideH",
+            "insideV",
+            "tl2br",
+            "tr2bl",
+        ),
+        "tblBorders": (
+            "top",
+            "left",
+            "bottom",
+            "right",
+            "insideH",
+            "insideV",
+            "start",
+            "end",
+            "tl2br",
+            "tr2bl",
+        ),
+        "pBdr": ("top", "left", "bottom", "right", "between", "bar"),
+        "tcMar": ("top", "start", "bottom", "end", "left", "right"),
+        "tblPr": (
+            "tblStyle",
+            "tblpPr",
+            "tblOverlap",
+            "bidiVisual",
+            "tblStyleRowBandSize",
+            "tblStyleColBandSize",
+            "tblW",
+            "jc",
+            "tblCellSpacing",
+            "tblInd",
+            "tblBorders",
+            "shd",
+            "tblLayout",
+            "tblCellMar",
+            "tblLook",
+            "tblCaption",
+            "tblDescription",
+            "tblPrChange",
+        ),
+    }
+
+    for element in list(document.element.iter()):
+        element_name = element.tag.rsplit("}", 1)[-1]
+        if element_name == "shd" and qn("w:val") not in element.attrib:
+            element.set(qn("w:val"), "clear")
+            fixed += 1
+
+        for attribute, value in list(element.attrib.items()):
+            attribute_name = attribute.rsplit("}", 1)[-1]
+
+            if (
+                attribute_name in {"color", "fill"}
+                or (element_name in {"color", "fill"} and attribute_name == "val")
+            ) and re.fullmatch(r"#[0-9A-Fa-f]{6}", value):
+                element.set(attribute, value[1:])
+                fixed += 1
+                continue
+
+            is_integer_measure = (
+                (element_name == "tblInd" and attribute_name == "w")
+                or (element_name == "w" and attribute_name == "val")
+                or attribute_name == "sz"
+            )
+            if not is_integer_measure or not re.fullmatch(
+                r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)", value
+            ):
+                continue
+
+            try:
+                rounded = int(Decimal(value).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+            except InvalidOperation:
+                continue
+
+            if element_name == "w" and attribute_name == "val":
+                rounded = min(600, max(1, rounded))
+            normalized = str(rounded)
+            if normalized != value:
+                element.set(attribute, normalized)
+                fixed += 1
+
+    for element in list(document.element.iter()):
+        if element.tag.rsplit("}", 1)[-1] != "tcPr":
+            continue
+        margins = element.findall(qn("w:tcMar"))
+        if len(margins) > 1:
+            primary = margins[0]
+            for duplicate in margins[1:]:
+                for side in list(duplicate):
+                    existing = primary.find(side.tag)
+                    if existing is not None:
+                        primary.replace(existing, side)
+                    else:
+                        primary.append(side)
+                element.remove(duplicate)
+
+    for element in list(document.element.iter()):
+        element_name = element.tag.rsplit("}", 1)[-1]
+        order = child_order.get(element_name)
+        if not order:
+            continue
+
+        rank = {name: index for index, name in enumerate(order)}
+        children = list(element)
+        sorted_children = sorted(
+            enumerate(children),
+            key=lambda item: (
+                rank.get(item[1].tag.rsplit("}", 1)[-1], len(rank)),
+                item[0],
+            ),
+        )
+        if [child for _, child in sorted_children] == children:
+            continue
+        for child in children:
+            element.remove(child)
+        for _, child in sorted_children:
+            element.append(child)
+
+    return fixed
+
+
 def convert_pdf(
     pdf_path: Path,
     docx_path: Path,
     *,
     headings: bool = False,
     embed_fonts: bool = True,
-) -> tuple[int, int, int, int, int, int, int, list[str]]:
+) -> tuple[int, int, int, int, int, int, int, int, int, int, list[str]]:
     """Convert a PDF and post-process the generated DOCX."""
     page_count, image_count = inspect_pdf(pdf_path)
 
     with TemporaryDirectory(prefix="pdf_to_word_") as temp_dir:
         raw_docx = Path(temp_dir) / "converted.docx"
-        configure_font_reader()
+        space_fix_counts = {"preserved": 0, "inferred": 0}
+        configure_font_reader(space_fix_counts)
         converter = Converter(str(pdf_path))
         try:
             converter.convert(str(raw_docx))
@@ -1532,6 +2265,7 @@ def convert_pdf(
             converter.close()
 
         document = Document(raw_docx)
+        contents_entry_count = repair_table_of_contents(document, pdf_path)
         image_fix_count = fix_inline_image_spacing(document)
 
         bullet_count = fix_bullet_fonts(document)
@@ -1550,6 +2284,7 @@ def convert_pdf(
             )
         else:
             embedded_font_count, font_warnings = 0, []
+        normalize_docx_xml(document)
         document.save(docx_path)
 
     return (
@@ -1560,6 +2295,9 @@ def convert_pdf(
         heading_count,
         font_fix_count,
         embedded_font_count,
+        space_fix_counts["preserved"],
+        space_fix_counts["inferred"],
+        contents_entry_count,
         font_warnings,
     )
 
@@ -1605,6 +2343,9 @@ def main() -> int:
         headings,
         font_fixes,
         fonts,
+        preserved_spaces,
+        inferred_spaces,
+        contents_entries,
         font_warnings,
     ) = convert_pdf(
         pdf_path,
@@ -1618,7 +2359,10 @@ def main() -> int:
         f"Pages: {pages} | Images: {images} | "
         f"Image fixes: {fixed} | Bullet fixes: {bullets} | "
         f"Headings: {headings} | Font fixes: {font_fixes} | "
-        f"Embedded fonts: {fonts}"
+        f"Embedded fonts: {fonts} | Spaces restored: "
+        f"{preserved_spaces + inferred_spaces} "
+        f"({preserved_spaces} retained, {inferred_spaces} inferred) | "
+        f"Contents entries repaired: {contents_entries}"
     )
     for warning in font_warnings:
         print(f"Font warning: {warning}")
